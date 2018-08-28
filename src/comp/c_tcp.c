@@ -149,7 +149,7 @@ static rohc_packet_t tcp_decide_FO_SO_packet_rnd(const struct rohc_comp_ctxt *co
 	__attribute__((warn_unused_result, nonnull(1, 2, 3)));
 
 /* IR and CO packets */
-static int code_IR_packet(struct rohc_comp_ctxt *const context,
+static int code_IR_packet(const struct rohc_comp_ctxt *const context,
                           const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                           const struct tcp_tmp_variables *const tmp,
                           uint8_t *const rohc_pkt,
@@ -166,7 +166,7 @@ static int code_CO_packet(const struct rohc_comp_ctxt *const context,
 	__attribute__((warn_unused_result, nonnull(1, 2, 3, 4)));
 static int co_baseheader(const struct rohc_comp_ctxt *const context,
                          const struct sc_tcp_context *const tcp_context,
-                         ip_context_t *const ip_inner_context,
+                         const ip_context_t *const ip_inner_context,
                          const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                          const struct tcp_tmp_variables *const tmp,
                          uint8_t *const rohc_pkt,
@@ -578,6 +578,7 @@ static bool c_tcp_create_from_pkt(struct rohc_comp_ctxt *const context,
 	const struct rohc_comp *const comp = context->compressor;
 	const struct tcphdr *const tcp = uncomp_pkt_hdrs->tcp;
 	struct sc_tcp_context *tcp_context;
+	size_t ipv4_hdrs_nr;
 	size_t ip_hdr_pos;
 	size_t i;
 	bool is_ok;
@@ -596,11 +597,12 @@ static bool c_tcp_create_from_pkt(struct rohc_comp_ctxt *const context,
 	context->specific = tcp_context;
 
 	/* create contexts for IP headers and their extensions */
+	ipv4_hdrs_nr = 0;
 	for(ip_hdr_pos = 0; ip_hdr_pos < uncomp_pkt_hdrs->ip_hdrs_nr; ip_hdr_pos++)
 	{
+		ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
 		const struct rohc_pkt_ip_hdr *const pkt_ip_hdr =
 			&(uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos]);
-		ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
 
 		ip_context->version = pkt_ip_hdr->version;
 		ip_context->dscp = pkt_ip_hdr->dscp;
@@ -612,11 +614,11 @@ static bool c_tcp_create_from_pkt(struct rohc_comp_ctxt *const context,
 			ip_context->last_ip_id = rohc_ntoh16(pkt_ip_hdr->ipv4->id);
 			rohc_debug(comp, ROHC_TRACE_COMP, context->profile->id,
 			           "IP-ID 0x%04x", ip_context->last_ip_id);
-			ip_context->last_ip_id_behavior = ROHC_IP_ID_BEHAVIOR_SEQ;
 			ip_context->ip_id_behavior = ROHC_IP_ID_BEHAVIOR_SEQ;
 			ip_context->df = pkt_ip_hdr->ipv4->df;
 			ip_context->saddr[0] = pkt_ip_hdr->ipv4->saddr;
 			ip_context->daddr[0] = pkt_ip_hdr->ipv4->daddr;
+			ipv4_hdrs_nr++;
 		}
 		else /* IPv6 */
 		{
@@ -628,9 +630,7 @@ static bool c_tcp_create_from_pkt(struct rohc_comp_ctxt *const context,
 	}
 	tcp_context->ip_contexts_nr = uncomp_pkt_hdrs->ip_hdrs_nr;
 
-
 	/* create context for TCP header */
-	tcp_context->ttl_hopl_change_count = 0;
 	tcp_context->tcp_window_change_count = 0;
 	tcp_context->ecn_used = false;
 	tcp_context->ecn_used_change_count = comp->oa_repetitions_nr;
@@ -643,6 +643,27 @@ static bool c_tcp_create_from_pkt(struct rohc_comp_ctxt *const context,
 	tcp_context->seq_num = rohc_ntoh32(tcp->seq_num);
 	tcp_context->ack_num = rohc_ntoh32(tcp->ack_num);
 	tcp_context->ack_stride = 0;
+
+	/* no outer IP-ID behavior will ever change if there is no outer IPv4 header */
+	if(tcp_context->ip_contexts[tcp_context->ip_contexts_nr - 1].version == IPV4)
+	{
+		if(ipv4_hdrs_nr == 1)
+		{
+			tcp_context->outer_ip_id_behavior_trans_nr = comp->oa_repetitions_nr;
+		}
+		else
+		{
+			tcp_context->outer_ip_id_behavior_trans_nr = 0;
+		}
+	}
+	else if(ipv4_hdrs_nr == 0)
+	{
+		tcp_context->outer_ip_id_behavior_trans_nr = comp->oa_repetitions_nr;
+	}
+	else
+	{
+		tcp_context->outer_ip_id_behavior_trans_nr = 0;
+	}
 
 	/* MSN */
 	is_ok = wlsb_new(&tcp_context->msn_wlsb, comp->oa_repetitions_nr);
@@ -875,15 +896,16 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 	struct sc_tcp_context *const tcp_context = context->specific;
 	struct c_tcp_opts_ctxt *const tcp_opts = &(tcp_context->tcp_opts);
 	const struct tcphdr *const tcp = uncomp_pkt_hdrs->tcp;
-	ip_context_t *const ip_inner_context =
+	ip_context_t *const inner_ip_ctxt =
 		&(tcp_context->ip_contexts[uncomp_pkt_hdrs->ip_hdrs_nr - 1]);
 	struct tcp_tmp_variables tmp;
+	size_t ip_hdr_pos;
 	int counter;
 
 	*packet_type = ROHC_PACKET_UNKNOWN;
 
 	/* detect changes between new uncompressed packet and context */
-	if(!tcp_detect_changes(context, ip_inner_context, uncomp_pkt_hdrs, &tmp))
+	if(!tcp_detect_changes(context, inner_ip_ctxt, uncomp_pkt_hdrs, &tmp))
 	{
 		rohc_comp_warn(context, "failed to detect changes in uncompressed packet");
 		goto error;
@@ -904,7 +926,7 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 	}
 
 	/* decide which packet to send */
-	*packet_type = tcp_decide_packet(context, ip_inner_context, uncomp_pkt_hdrs, &tmp);
+	*packet_type = tcp_decide_packet(context, inner_ip_ctxt, uncomp_pkt_hdrs, &tmp);
 
 	/* does the packet update the decompressor context? */
 	if(rohc_packet_carry_crc_7_or_8(*packet_type))
@@ -949,20 +971,6 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 
 	rohc_comp_debug(context, "update context:");
 
-	/* update the context with the new numbers of IP extension headers */
-	{
-		size_t ip_hdr_pos;
-		for(ip_hdr_pos = 0; ip_hdr_pos < tcp_context->ip_contexts_nr; ip_hdr_pos++)
-		{
-			rohc_comp_debug(context, "  update context of IP header #%zu:",
-			                ip_hdr_pos + 1);
-			tcp_context->ip_contexts[ip_hdr_pos].opts_nr =
-				uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].exts_nr;
-			rohc_comp_debug(context, "    %u extension headers",
-			                tcp_context->ip_contexts[ip_hdr_pos].opts_nr);
-		}
-	}
-
 	/* update the context with the new TCP header */
 	tcp_context->seq_num = tmp.seq_num;
 	tcp_context->ack_num = tmp.ack_num;
@@ -976,14 +984,42 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 	c_add_wlsb(&tcp_context->msn_wlsb, tmp.new_msn, tmp.new_msn);
 	tcp_context->last_msn = tmp.new_msn;
 
-	if(uncomp_pkt_hdrs->innermost_ip_hdr->version == IPV4)
+	/* update the context for all IP headers */
+	for(ip_hdr_pos = 0; ip_hdr_pos < tcp_context->ip_contexts_nr; ip_hdr_pos++)
 	{
-		/* add the new innermost IP-ID / SN delta to the W-LSB encoding object */
-		c_add_wlsb(&tcp_context->ip_id_wlsb, tmp.new_msn, tmp.ip_id_delta);
+		const struct ip_hdr *const ip_hdr = uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].ip;
+		ip_context_t *const ip_ctxt = &(tcp_context->ip_contexts[ip_hdr_pos]);
+
+		tcp_context->ip_contexts[ip_hdr_pos].opts_nr =
+			uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].exts_nr;
+
+		ip_ctxt->ip_id_behavior = tmp.ip_id_behaviors[ip_hdr_pos];
+
+		if(ip_hdr->version == IPV4)
+		{
+			const struct ipv4_hdr *const ipv4 = (struct ipv4_hdr *) ip_hdr;
+			ip_ctxt->dscp = ipv4->dscp;
+			ip_ctxt->ttl_hopl = ipv4->ttl;
+			ip_ctxt->df = ipv4->df;
+			ip_ctxt->last_ip_id = rohc_ntoh16(ipv4->id);
+			/* add the new innermost IP-ID / SN delta to the W-LSB encoding object */
+			if((ip_hdr_pos + 1) == tcp_context->ip_contexts_nr)
+			{
+				c_add_wlsb(&tcp_context->ip_id_wlsb, tmp.new_msn, tmp.ip_id_delta);
+			}
+		}
+		else
+		{
+			const struct ipv6_hdr *const ipv6 = (struct ipv6_hdr *) ip_hdr;
+			ip_ctxt->dscp = ipv6_get_dscp(ipv6);
+			ip_ctxt->ttl_hopl = ipv6->hl;
+		}
+		/* add the new innermost TTL/Hop Limit to the W-LSB encoding object */
+		if((ip_hdr_pos + 1) == tcp_context->ip_contexts_nr)
+		{
+			c_add_wlsb(&tcp_context->ttl_hopl_wlsb, tmp.new_msn, ip_ctxt->ttl_hopl);
+		}
 	}
-	/* add the new innermost TTL/Hop Limit to the W-LSB encoding object */
-	c_add_wlsb(&tcp_context->ttl_hopl_wlsb, tmp.new_msn,
-	           uncomp_pkt_hdrs->innermost_ip_hdr->ttl_hl);
 
 	/* sequence number */
 	c_add_wlsb(&tcp_context->seq_wlsb, tmp.new_msn, tcp_context->seq_num);
@@ -1042,9 +1078,20 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 	{
 		tcp_context->tcp_urg_ptr_trans_nr++;
 	}
-	if(tcp_context->ttl_hopl_change_count < oa_repetitions_nr)
+	for(ip_hdr_pos = 0; ip_hdr_pos < uncomp_pkt_hdrs->ip_hdrs_nr; ip_hdr_pos++)
 	{
-		tcp_context->ttl_hopl_change_count++;
+		if(tcp_context->ttl_hopl_change_count[ip_hdr_pos] < oa_repetitions_nr)
+		{
+			tcp_context->ttl_hopl_change_count[ip_hdr_pos]++;
+		}
+	}
+	if(tcp_context->innermost_ttl_hopl_change_count < oa_repetitions_nr)
+	{
+		tcp_context->innermost_ttl_hopl_change_count++;
+	}
+	if(tcp_context->outer_ip_id_behavior_trans_nr < oa_repetitions_nr)
+	{
+		tcp_context->outer_ip_id_behavior_trans_nr++;
 	}
 	if(tcp_context->innermost_ip_id_behavior_trans_nr < oa_repetitions_nr)
 	{
@@ -1151,7 +1198,7 @@ error:
  * @return                  The length of the ROHC packet if successful,
  *                          -1 otherwise
  */
-static int code_IR_packet(struct rohc_comp_ctxt *const context,
+static int code_IR_packet(const struct rohc_comp_ctxt *const context,
                           const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                           const struct tcp_tmp_variables *const tmp,
                           uint8_t *const rohc_pkt,
@@ -1543,7 +1590,7 @@ error:
  */
 static int co_baseheader(const struct rohc_comp_ctxt *const context,
                          const struct sc_tcp_context *const tcp_context,
-                         ip_context_t *const inner_ip_ctxt,
+                         const ip_context_t *const inner_ip_ctxt,
                          const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                          const struct tcp_tmp_variables *const tmp,
                          uint8_t *const rohc_pkt,
@@ -1662,23 +1709,6 @@ static int co_baseheader(const struct rohc_comp_ctxt *const context,
 	rohc_hdr_len += ret;
 
 	rohc_comp_dump_buf(context, "co_header", rohc_pkt, rohc_hdr_len);
-
-	/* update context with new values (done at the very end to avoid wrongly
-	 * updating the context in case of compression failure) */
-	if(uncomp_pkt_hdrs->innermost_ip_hdr->version == IPV4)
-	{
-		const struct ipv4_hdr *const inner_ipv4 = uncomp_pkt_hdrs->innermost_ip_hdr->ipv4;
-		inner_ip_ctxt->last_ip_id_behavior = inner_ip_ctxt->ip_id_behavior;
-		inner_ip_ctxt->last_ip_id = rohc_ntoh16(inner_ipv4->id);
-		inner_ip_ctxt->df = inner_ipv4->df;
-		inner_ip_ctxt->dscp = inner_ipv4->dscp;
-	}
-	else
-	{
-		const struct ipv6_hdr *const inner_ipv6 = uncomp_pkt_hdrs->innermost_ip_hdr->ipv6;
-		inner_ip_ctxt->dscp = ipv6_get_dscp(inner_ipv6);
-	}
-	inner_ip_ctxt->ttl_hopl = uncomp_pkt_hdrs->innermost_ip_hdr->ttl_hl;
 
 	return rohc_hdr_len;
 
@@ -2854,9 +2884,9 @@ static int c_tcp_build_co_common(const struct rohc_comp_ctxt *const context,
 			uncomp_pkt_hdrs->innermost_ip_hdr->ipv4;
 		// =:= irregular(1) [ 1 ];
 		rohc_comp_debug(context, "optional_ip_id_lsb(behavior = %d, IP-ID = 0x%04x, "
-		                "IP-ID offset = 0x%04x)", inner_ip_ctxt->ip_id_behavior,
+		                "IP-ID offset = 0x%04x)", tmp->innermost_ip_id_behavior,
 		                rohc_ntoh16(inner_ipv4->id), tmp->ip_id_delta);
-		ret = c_optional_ip_id_lsb(inner_ip_ctxt->ip_id_behavior,
+		ret = c_optional_ip_id_lsb(tmp->innermost_ip_id_behavior,
 		                           inner_ipv4->id, tmp->ip_id_delta,
 		                           &tcp_context->ip_id_wlsb, 3,
 		                           co_common_opt, rohc_remain_len, &indicator);
@@ -2870,7 +2900,7 @@ static int c_tcp_build_co_common(const struct rohc_comp_ctxt *const context,
 		co_common_opt_len += ret;
 		rohc_remain_len -= ret;
 		// =:= ip_id_behavior_choice(true) [ 2 ];
-		co_common->ip_id_behavior = inner_ip_ctxt->ip_id_behavior;
+		co_common->ip_id_behavior = tmp->innermost_ip_id_behavior;
 		rohc_comp_debug(context, "ip_id_indicator = %d, "
 		                "ip_id_behavior = %d (innermost IP-ID encoded on %d bytes)",
 		                co_common->ip_id_indicator, co_common->ip_id_behavior, ret);
@@ -2964,7 +2994,7 @@ static int c_tcp_build_co_common(const struct rohc_comp_ctxt *const context,
 
 	/* ttl_hopl */
 	ret = c_static_or_irreg8(uncomp_pkt_hdrs->innermost_ip_hdr->ttl_hl,
-	                         !tmp->ttl_hopl_changed,
+	                         !tmp->innermost_ttl_hopl_changed,
 	                         co_common_opt, rohc_remain_len, &indicator);
 	if(ret < 0)
 	{
@@ -3051,6 +3081,9 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 	tmp->is_ipv6_exts_list_static_changed = false;
 	tmp->is_ipv6_exts_list_dyn_changed = false;
 
+	/* by default, no outer IP-ID changed its behavior */
+	tmp->outer_ip_id_behavior_changed = false;
+
 	/* compute or find the new SN */
 	tmp->new_msn = c_tcp_get_next_msn(context);
 	rohc_comp_debug(context, "MSN = 0x%04x / %u", tmp->new_msn, tmp->new_msn);
@@ -3083,11 +3116,84 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 		pkt_ecn_vals |= ecn;
 
 		/* IP TTL/HL */
-		if(!is_innermost && ttl_hl != ip_context->ttl_hopl)
+		if(ttl_hl != ip_context->ttl_hopl)
 		{
-			tmp->ttl_irreg_chain_flag |= 1;
 			rohc_comp_debug(context, "  TTL/HL did change: 0x%02x -> 0x%02x",
 			                ip_context->ttl_hopl, ttl_hl);
+			tmp->ttl_hopl_changed[ip_hdr_pos] = true;
+			if(!is_innermost)
+			{
+				tmp->ttl_irreg_chain_flag |= 1;
+			}
+		}
+		else
+		{
+			rohc_comp_debug(context, "  TTL/HL didn't change: 0x%02x -> 0x%02x",
+			                ip_context->ttl_hopl, ttl_hl);
+			tmp->ttl_hopl_changed[ip_hdr_pos] = false;
+		}
+		if(tmp->ttl_hopl_changed[ip_hdr_pos])
+		{
+			rohc_comp_debug(context, "  TTL/HL changed (%u -> %u) in current "
+			                "packet, it shall be transmitted %u times",
+			                ip_context->ttl_hopl, ttl_hl, oa_repetitions_nr);
+			tcp_context->ttl_hopl_change_count[ip_hdr_pos] = 0;
+		}
+		else if(tcp_context->ttl_hopl_change_count[ip_hdr_pos] < oa_repetitions_nr)
+		{
+			rohc_comp_debug(context, "  TTL/HL changed in last packets, it shall "
+			                "be transmitted %u times more", oa_repetitions_nr -
+			                tcp_context->ttl_hopl_change_count[ip_hdr_pos]);
+			tmp->ttl_hopl_changed[ip_hdr_pos] = true;
+		}
+		if(is_innermost)
+		{
+			tmp->innermost_ttl_hopl_changed = tmp->ttl_hopl_changed[ip_hdr_pos];
+			tcp_context->innermost_ttl_hopl_change_count =
+				tcp_context->ttl_hopl_change_count[ip_hdr_pos];
+		}
+
+		/* determine the IP-ID behavior of the outer IPv4 headers */
+		if(ip_hdr->ip->version == IPV6)
+		{
+			tmp->ip_id_behaviors[ip_hdr_pos] = ip_context->ip_id_behavior;
+		}
+		else if(!is_innermost)
+		{
+			const uint16_t ip_id = rohc_ntoh16(ip_hdr->ipv4->id);
+			const uint16_t last_ip_id = ip_context->last_ip_id;
+			const rohc_ip_id_behavior_t last_ip_id_behavior = ip_context->ip_id_behavior;
+			rohc_ip_id_behavior_t new_ip_id_behavior;
+
+			rohc_comp_debug(context, "  outer IP-ID behaved as %s",
+			                rohc_ip_id_behavior_get_descr(last_ip_id_behavior));
+			rohc_comp_debug(context, "  outer IP-ID = 0x%04x -> 0x%04x",
+			                last_ip_id, ip_id);
+
+			/* RFC6846 §6.1.2 reads:
+			 *   If more than one level of IP headers is present, ROHC-TCP can assign
+			 *   a sequential behavior (NBO or byte-swapped) only to the IP-ID of the
+			 *   innermost IP header.  This is because only this IP-ID can possibly
+			 *   have a sufficiently close correlation with the MSN (see also
+			 *   Section 6.1.1) to compress it as a sequentially changing field.
+			 *   Therefore, a compressor MUST NOT assign either the sequential (NBO)
+			 *   or the sequential byte-swapped behavior to tunneling headers.
+			 */
+			if(ip_id == 0)
+			{
+				new_ip_id_behavior = ROHC_IP_ID_BEHAVIOR_ZERO;
+			}
+			else
+			{
+				new_ip_id_behavior = ROHC_IP_ID_BEHAVIOR_RAND;
+			}
+			tmp->ip_id_behaviors[ip_hdr_pos] = new_ip_id_behavior;
+			rohc_comp_debug(context, "  outer IP-ID now behaves as %s",
+			                rohc_ip_id_behavior_get_descr(new_ip_id_behavior));
+			if(last_ip_id_behavior != new_ip_id_behavior)
+			{
+				tmp->outer_ip_id_behavior_changed = true;
+			}
 		}
 
 		/* IPv6 extension headers */
@@ -3106,10 +3212,14 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 		}
 
 	}
-	tmp->outer_ip_ttl_changed =
-		(tmp->ttl_irreg_chain_flag != 0);
-	tcp_field_descr_change(context, "one or more outer TTL/HL values",
-	                       tmp->outer_ip_ttl_changed, 0);
+	tmp->outer_ip_ttl_changed = (tmp->ttl_irreg_chain_flag != 0);
+	if(uncomp_pkt_hdrs->ip_hdrs_nr > 1)
+	{
+		tcp_field_descr_change(context, "one or more outer IP-ID behaviors",
+		                       tmp->outer_ip_id_behavior_changed, 0);
+		tcp_field_descr_change(context, "one or more outer TTL/HL values",
+		                       tmp->outer_ip_ttl_changed, 0);
+	}
 
 	/* TCP ECN */
 	pkt_ecn_vals |= uncomp_pkt_hdrs->tcp->ecn_flags;
@@ -3122,42 +3232,49 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 	/* determine the IP-ID behavior of the innermost IPv4 header */
 	if(uncomp_pkt_hdrs->innermost_ip_hdr->version == IPV4)
 	{
+		const ip_context_t *const innermost_ip_ctxt =
+			&(tcp_context->ip_contexts[tcp_context->ip_contexts_nr - 1]);
 		const struct ipv4_hdr *const inner_ipv4 =
 			uncomp_pkt_hdrs->innermost_ip_hdr->ipv4;
 		const uint16_t ip_id = rohc_ntoh16(inner_ipv4->id);
+		const uint16_t last_ip_id = innermost_ip_ctxt->last_ip_id;
+		const rohc_ip_id_behavior_t last_ip_id_behavior =
+			innermost_ip_ctxt->ip_id_behavior;
+		rohc_ip_id_behavior_t new_ip_id_behavior;
 
-		rohc_comp_debug(context, "IP-ID behaved as %s",
-		                rohc_ip_id_behavior_get_descr(inner_ip_ctxt->ip_id_behavior));
-		rohc_comp_debug(context, "IP-ID = 0x%04x -> 0x%04x",
-		                inner_ip_ctxt->last_ip_id, ip_id);
+		rohc_comp_debug(context, "innermost IP-ID behaved as %s",
+		                rohc_ip_id_behavior_get_descr(last_ip_id_behavior));
+		rohc_comp_debug(context, "innermost IP-ID = 0x%04x -> 0x%04x",
+		                last_ip_id, ip_id);
 
 		if(context->num_sent_packets == 0)
 		{
 			/* first packet, be optimistic: choose sequential behavior */
-			inner_ip_ctxt->ip_id_behavior = ROHC_IP_ID_BEHAVIOR_SEQ;
+			new_ip_id_behavior = ROHC_IP_ID_BEHAVIOR_SEQ;
 		}
 		else
 		{
-			inner_ip_ctxt->ip_id_behavior =
-				rohc_comp_detect_ip_id_behavior(inner_ip_ctxt->last_ip_id, ip_id, 1, 19);
+			new_ip_id_behavior =
+				rohc_comp_detect_ip_id_behavior(last_ip_id, ip_id, 1, 19);
 		}
-		rohc_comp_debug(context, "IP-ID now behaves as %s",
-		                rohc_ip_id_behavior_get_descr(inner_ip_ctxt->ip_id_behavior));
+		tmp->ip_id_behaviors[tcp_context->ip_contexts_nr - 1] = new_ip_id_behavior;
+		tmp->innermost_ip_id_behavior = new_ip_id_behavior;
+		rohc_comp_debug(context, "innermost IP-ID now behaves as %s",
+		                rohc_ip_id_behavior_get_descr(new_ip_id_behavior));
 
 		/* does innermost IP-ID behavior changed? */
-		tmp->ip_id_behavior_changed =
-			(inner_ip_ctxt->last_ip_id_behavior != inner_ip_ctxt->ip_id_behavior);
-		tcp_field_descr_change(context, "IP-ID behavior",
-		                       tmp->ip_id_behavior_changed, 0);
+		tmp->innermost_ip_id_behavior_changed =
+		  (last_ip_id_behavior != new_ip_id_behavior);
+		tcp_field_descr_change(context, "innermost IP-ID behavior",
+		                       tmp->innermost_ip_id_behavior_changed, 0);
 
 		/* compute the new innermost IP-ID / SN delta */
-		if(inner_ip_ctxt->ip_id_behavior == ROHC_IP_ID_BEHAVIOR_SEQ_SWAP)
+		if(new_ip_id_behavior == ROHC_IP_ID_BEHAVIOR_SEQ_SWAP)
 		{
 			/* specific case of IP-ID delta for sequential swapped behavior */
 			tmp->ip_id_delta = swab16(ip_id) - tmp->new_msn;
-			rohc_comp_debug(context, "new outer IP-ID delta = 0x%x / %u (behavior = %d)",
-			                tmp->ip_id_delta, tmp->ip_id_delta,
-			                inner_ip_ctxt->ip_id_behavior);
+			rohc_comp_debug(context, "new innermost IP-ID delta = 0x%x / %u",
+			                tmp->ip_id_delta, tmp->ip_id_delta);
 		}
 		else
 		{
@@ -3165,9 +3282,8 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 			 * important to always compute the IP-ID delta and record it in W-LSB,
 			 * so that the IP-ID deltas of next packets may be correctly encoded */
 			tmp->ip_id_delta = ip_id - tmp->new_msn;
-			rohc_comp_debug(context, "new outer IP-ID delta = 0x%x / %u (behavior = %d)",
-			                tmp->ip_id_delta, tmp->ip_id_delta,
-			                inner_ip_ctxt->ip_id_behavior);
+			rohc_comp_debug(context, "new innermost IP-ID delta = 0x%x / %u",
+			                tmp->ip_id_delta, tmp->ip_id_delta);
 		}
 
 		tmp->ip_df_changed = !!(inner_ipv4->df != inner_ip_ctxt->df);
@@ -3183,7 +3299,8 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 
 		/* no IP-ID for IPv6 */
 		tmp->ip_id_delta = 0;
-		tmp->ip_id_behavior_changed = false;
+		tmp->innermost_ip_id_behavior_changed = false;
+		tmp->innermost_ip_id_behavior = inner_ip_ctxt->ip_id_behavior;
 
 		tmp->ip_df_changed = false; /* no DF for IPv6 */
 
@@ -3205,28 +3322,6 @@ static bool tcp_detect_changes(struct rohc_comp_ctxt *const context,
 		                "it shall be transmitted %u times more", oa_repetitions_nr -
 		                tcp_context->innermost_dscp_trans_nr);
 		tmp->dscp_changed = true;
-	}
-
-	/* encode innermost IPv4 TTL or IPv6 Hop Limit */
-	if(uncomp_pkt_hdrs->innermost_ip_hdr->ttl_hl != inner_ip_ctxt->ttl_hopl)
-	{
-		rohc_comp_debug(context, "innermost IP TTL/HL changed (%u -> %u) "
-		                "in current packet, it shall be transmitted %u times",
-		                inner_ip_ctxt->ttl_hopl,
-		                uncomp_pkt_hdrs->innermost_ip_hdr->ttl_hl, oa_repetitions_nr);
-		tmp->ttl_hopl_changed = true;
-		tcp_context->ttl_hopl_change_count = 0;
-	}
-	else if(tcp_context->ttl_hopl_change_count < oa_repetitions_nr)
-	{
-		rohc_comp_debug(context, "innermost IP TTL/HL changed in last packets, "
-		                "it shall be transmitted %u times more", oa_repetitions_nr -
-		                tcp_context->ttl_hopl_change_count);
-		tmp->ttl_hopl_changed = true;
-	}
-	else
-	{
-		tmp->ttl_hopl_changed = false;
 	}
 
 	/* compute how many bits are needed to send header fields */
@@ -3686,8 +3781,23 @@ static bool tcp_detect_changes_tcp_hdr(struct rohc_comp_ctxt *const context,
 	tmp->tcp_urg_ptr_changed = (tcp->urg_ptr != tcp_context->urg_ptr_nbo);
 	tcp_field_descr_change(context, "TCP URG pointer", tmp->tcp_urg_ptr_changed, 0);
 
+	/* ouetr IP-ID behaviors that change shall be transmitted several times */
+	if(tmp->outer_ip_id_behavior_changed)
+	{
+		rohc_comp_debug(context, "at least one outer IP-ID behavior changed in current "
+		                "packet, it shall be transmitted %u times", oa_repetitions_nr);
+		tcp_context->outer_ip_id_behavior_trans_nr = 0;
+	}
+	else if(tcp_context->outer_ip_id_behavior_trans_nr < oa_repetitions_nr)
+	{
+		rohc_comp_debug(context, "at least one outer IP-ID behavior changed "
+		                "in last packets, it shall be transmitted %u times more",
+		                oa_repetitions_nr - tcp_context->outer_ip_id_behavior_trans_nr);
+		tmp->outer_ip_id_behavior_changed = true;
+	}
+
 	/* innermost IP-ID behavior that changes shall be transmitted several times */
-	if(tmp->ip_id_behavior_changed)
+	if(tmp->innermost_ip_id_behavior_changed)
 	{
 		rohc_comp_debug(context, "innermost IP-ID behavior changed in current "
 		                "packet, it shall be transmitted %u times", oa_repetitions_nr);
@@ -3698,7 +3808,7 @@ static bool tcp_detect_changes_tcp_hdr(struct rohc_comp_ctxt *const context,
 		rohc_comp_debug(context, "innermost IP-ID behavior changed in last packets, "
 		                "it shall be transmitted %u times more", oa_repetitions_nr -
 		                tcp_context->innermost_ip_id_behavior_trans_nr);
-		tmp->ip_id_behavior_changed = true;
+		tmp->innermost_ip_id_behavior_changed = true;
 	}
 
 	/* TCP sequence number that changes shall be transmitted several times */
@@ -3896,6 +4006,12 @@ static rohc_packet_t tcp_decide_FO_SO_packet(const struct rohc_comp_ctxt *const 
 		                "changed its dynamic part");
 		packet_type = ROHC_PACKET_IR_DYN;
 	}
+	else if(tmp->outer_ip_id_behavior_changed)
+	{
+		rohc_comp_debug(context, "force packet IR-DYN because at least one outer "
+		                "IP-ID changed its behavior");
+		packet_type = ROHC_PACKET_IR_DYN;
+	}
 	else if(!wlsb_is_kp_possible_16bits(&tcp_context->msn_wlsb, tmp->new_msn, 4,
 	                                    ROHC_LSB_SHIFT_TCP_SN))
 	{
@@ -3910,7 +4026,7 @@ static rohc_packet_t tcp_decide_FO_SO_packet(const struct rohc_comp_ctxt *const 
 		packet_type = ROHC_PACKET_IR_DYN;
 	}
 	else if(tmp->outer_ip_ttl_changed ||
-	        tmp->ip_id_behavior_changed ||
+	        tmp->innermost_ip_id_behavior_changed ||
 	        tmp->ip_df_changed ||
 	        tmp->dscp_changed ||
 	        tmp->tcp_ack_flag_changed ||
@@ -3925,14 +4041,14 @@ static rohc_packet_t tcp_decide_FO_SO_packet(const struct rohc_comp_ctxt *const 
 		packet_type = ROHC_PACKET_TCP_CO_COMMON;
 	}
 	else if(tmp->ecn_used_changed ||
-	        tmp->ttl_hopl_changed)
+	        tmp->innermost_ttl_hopl_changed)
 	{
 		/* use compressed header with a 7-bit CRC (rnd_8, seq_8 or common):
 		 *  - use common if too many LSB of sequence number are required
 		 *  - use common if too many LSB of sequence number are required
 		 *  - use common if too many LSB of innermost TTL/Hop Limit are required
 		 *  - use common if window changed */
-		if(ip_inner_context->ip_id_behavior <= ROHC_IP_ID_BEHAVIOR_SEQ_SWAP &&
+		if(tmp->innermost_ip_id_behavior <= ROHC_IP_ID_BEHAVIOR_SEQ_SWAP &&
 		   wlsb_is_kp_possible_16bits(&tcp_context->ip_id_wlsb, tmp->ip_id_delta, 4, 3) &&
 		   wlsb_is_kp_possible_32bits(&tcp_context->seq_wlsb, tmp->seq_num, 14, 8191) &&
 		   wlsb_is_kp_possible_32bits(&tcp_context->ack_wlsb, tmp->ack_num, 15, 8191) &&
@@ -3945,7 +4061,7 @@ static rohc_packet_t tcp_decide_FO_SO_packet(const struct rohc_comp_ctxt *const 
 			TRACE_GOTO_CHOICE;
 			packet_type = ROHC_PACKET_TCP_SEQ_8;
 		}
-		else if(ip_inner_context->ip_id_behavior > ROHC_IP_ID_BEHAVIOR_SEQ_SWAP &&
+		else if(tmp->innermost_ip_id_behavior > ROHC_IP_ID_BEHAVIOR_SEQ_SWAP &&
 		        wlsb_is_kp_possible_32bits(&tcp_context->seq_wlsb, tmp->seq_num, 16, 65535) &&
 		        wlsb_is_kp_possible_32bits(&tcp_context->ack_wlsb, tmp->ack_num, 16, 16383) &&
 		        wlsb_is_kp_possible_8bits(&tcp_context->ttl_hopl_wlsb,
@@ -3962,15 +4078,15 @@ static rohc_packet_t tcp_decide_FO_SO_packet(const struct rohc_comp_ctxt *const 
 			packet_type = ROHC_PACKET_TCP_CO_COMMON;
 		}
 	}
-	else if(ip_inner_context->ip_id_behavior <= ROHC_IP_ID_BEHAVIOR_SEQ_SWAP)
+	else if(tmp->innermost_ip_id_behavior <= ROHC_IP_ID_BEHAVIOR_SEQ_SWAP)
 	{
 		/* ROHC_IP_ID_BEHAVIOR_SEQ or ROHC_IP_ID_BEHAVIOR_SEQ_SWAP:
 		 * co_common or seq_X packet types */
 		packet_type = tcp_decide_FO_SO_packet_seq(context, uncomp_pkt_hdrs, tmp,
 		                                          crc7_at_least);
 	}
-	else if(ip_inner_context->ip_id_behavior == ROHC_IP_ID_BEHAVIOR_RAND ||
-	        ip_inner_context->ip_id_behavior == ROHC_IP_ID_BEHAVIOR_ZERO)
+	else if(tmp->innermost_ip_id_behavior == ROHC_IP_ID_BEHAVIOR_RAND ||
+	        tmp->innermost_ip_id_behavior == ROHC_IP_ID_BEHAVIOR_ZERO)
 	{
 		/* ROHC_IP_ID_BEHAVIOR_RAND or ROHC_IP_ID_BEHAVIOR_ZERO:
 		 * co_common or rnd_X packet types */

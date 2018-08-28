@@ -36,15 +36,15 @@
 #include <assert.h>
 
 static int tcp_code_dynamic_ipv4_part(const struct rohc_comp_ctxt *const context,
-                                      ip_context_t *const ip_context,
+                                      const ip_context_t *const ip_context,
                                       const struct ipv4_hdr *const ipv4,
-                                      const bool is_innermost,
+                                      const rohc_ip_id_behavior_t ip_id_behavior,
                                       uint8_t *const rohc_data,
                                       const size_t rohc_max_len)
 	__attribute__((warn_unused_result, nonnull(1, 2, 3, 5)));
 
 static int tcp_code_dynamic_ipv6_part(const struct rohc_comp_ctxt *const context,
-                                      ip_context_t *const ip_context,
+                                      const ip_context_t *const ip_context,
                                       const struct ipv6_hdr *const ipv6,
                                       uint8_t *const rohc_data,
                                       const size_t rohc_max_len)
@@ -76,20 +76,16 @@ static int tcp_code_dynamic_tcp_part(const struct rohc_comp_ctxt *const context,
  * @return                  The length of the ROHC packet if successful,
  *                          -1 otherwise
  */
-int tcp_code_dyn_part(struct rohc_comp_ctxt *const context,
+int tcp_code_dyn_part(const struct rohc_comp_ctxt *const context,
                       const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                       const struct tcp_tmp_variables *const tmp,
                       uint8_t *const rohc_pkt,
                       const size_t rohc_pkt_max_len)
 {
-	struct sc_tcp_context *const tcp_context = context->specific;
+	const struct sc_tcp_context *const tcp_context = context->specific;
 
 	uint8_t *rohc_remain_data = rohc_pkt;
 	size_t rohc_remain_len = rohc_pkt_max_len;
-
-	ip_context_t *const inner_ip_context =
-		&(tcp_context->ip_contexts[uncomp_pkt_hdrs->ip_hdrs_nr - 1]);
-	const struct ip_hdr *inner_ip_hdr = uncomp_pkt_hdrs->innermost_ip_hdr->ip;
 
 	size_t ip_hdr_pos;
 	int ret;
@@ -98,14 +94,16 @@ int tcp_code_dyn_part(struct rohc_comp_ctxt *const context,
 	for(ip_hdr_pos = 0; ip_hdr_pos < uncomp_pkt_hdrs->ip_hdrs_nr; ip_hdr_pos++)
 	{
 		const struct ip_hdr *const ip = uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].ip;
-		ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
-		const bool is_inner = !!(ip_hdr_pos + 1 == tcp_context->ip_contexts_nr);
+		const ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
 
 		if(ip->version == IPV4)
 		{
 			const struct ipv4_hdr *const ipv4 = (struct ipv4_hdr *) ip;
+			const rohc_ip_id_behavior_t ip_id_behavior =
+				tmp->ip_id_behaviors[ip_hdr_pos];
 
-			ret = tcp_code_dynamic_ipv4_part(context, ip_context, ipv4, is_inner,
+			ret = tcp_code_dynamic_ipv4_part(context, ip_context, ipv4,
+			                                 ip_id_behavior,
 			                                 rohc_remain_data, rohc_remain_len);
 			if(ret < 0)
 			{
@@ -176,30 +174,6 @@ int tcp_code_dyn_part(struct rohc_comp_ctxt *const context,
 #endif
 	rohc_remain_len -= ret;
 
-	/* update context with new values (done at the very end to avoid wrongly
-	 * updating the context in case of compression failure) */
-	if(inner_ip_hdr->version == IPV4)
-	{
-		const struct ipv4_hdr *const inner_ipv4 = (struct ipv4_hdr *) inner_ip_hdr;
-		inner_ip_context->last_ip_id_behavior =
-			inner_ip_context->ip_id_behavior;
-		inner_ip_context->last_ip_id = rohc_ntoh16(inner_ipv4->id);
-		inner_ip_context->df = inner_ipv4->df;
-		inner_ip_context->dscp = inner_ipv4->dscp;
-	}
-	else if(inner_ip_hdr->version == IPV6)
-	{
-		const struct ipv6_hdr *const inner_ipv6 = (struct ipv6_hdr *) inner_ip_hdr;
-		inner_ip_context->dscp = ipv6_get_dscp(inner_ipv6);
-	}
-	else
-	{
-		rohc_comp_warn(context, "unexpected IP version %u", inner_ip_hdr->version);
-		assert(0);
-		goto error;
-	}
-	inner_ip_context->ttl_hopl = uncomp_pkt_hdrs->innermost_ip_hdr->ttl_hl;
-
 	return (rohc_pkt_max_len - rohc_remain_len);
 
 error:
@@ -213,17 +187,16 @@ error:
  * @param context         The compression context
  * @param ip_context      The specific IP compression context
  * @param ipv4            The IPv4 header
- * @param is_innermost    true if the IP header is the innermost of the packet,
- *                        false otherwise
+ * @param ip_id_behavior  The IP-ID behavior of the IPv4 header
  * @param[out] rohc_data  The ROHC packet being built
  * @param rohc_max_len    The max remaining length in the ROHC buffer
  * @return                The length appended in the ROHC buffer if positive,
  *                        -1 in case of error
  */
 static int tcp_code_dynamic_ipv4_part(const struct rohc_comp_ctxt *const context,
-                                      ip_context_t *const ip_context,
+                                      const ip_context_t *const ip_context,
                                       const struct ipv4_hdr *const ipv4,
-                                      const bool is_innermost,
+                                      const rohc_ip_id_behavior_t ip_id_behavior,
                                       uint8_t *const rohc_data,
                                       const size_t rohc_max_len)
 {
@@ -244,36 +217,14 @@ static int tcp_code_dynamic_ipv4_part(const struct rohc_comp_ctxt *const context
 	/* IP-ID */
 	ip_id = rohc_ntoh16(ipv4->id);
 	rohc_comp_debug(context, "ip_id_behavior = %d, last IP-ID = 0x%04x, "
-	                "IP-ID = 0x%04x", ip_context->ip_id_behavior,
-	                ip_context->last_ip_id, ip_id);
+	                "IP-ID = 0x%04x", ip_id_behavior, ip_context->last_ip_id, ip_id);
 
 	ipv4_dynamic1->reserved = 0;
 	ipv4_dynamic1->df = ipv4->df;
 
 	/* IP-ID behavior
 	 * cf. RFC4996 page 60/61 ip_id_behavior_choice() and ip_id_enc_dyn() */
-	if(is_innermost)
-	{
-		/* all behavior values possible */
-		ipv4_dynamic1->ip_id_behavior = ip_context->ip_id_behavior;
-	}
-	else
-	{
-		/* only ROHC_IP_ID_BEHAVIOR_RAND or ROHC_IP_ID_BEHAVIOR_ZERO */
-		if(ipv4->id == 0)
-		{
-			ipv4_dynamic1->ip_id_behavior = ROHC_IP_ID_BEHAVIOR_ZERO;
-		}
-		else
-		{
-			ipv4_dynamic1->ip_id_behavior = ROHC_IP_ID_BEHAVIOR_RAND;
-		}
-		/* TODO: should not update context there */
-		ip_context->ip_id_behavior = ipv4_dynamic1->ip_id_behavior;
-	}
-	/* TODO: should not update context there */
-	ip_context->last_ip_id_behavior = ip_context->ip_id_behavior;
-
+	ipv4_dynamic1->ip_id_behavior = ip_id_behavior;
 	ipv4_dynamic1->dscp = ipv4->dscp;
 	ipv4_dynamic1->ip_ecn_flags = ipv4->ecn;
 	ipv4_dynamic1->ttl_hopl = ipv4->ttl;
@@ -302,12 +253,6 @@ static int tcp_code_dynamic_ipv4_part(const struct rohc_comp_ctxt *const context
 		                ipv4_dynamic1->ip_id_behavior, rohc_ntoh16(ipv4->id));
 	}
 
-	/* TODO: should not update context there */
-	ip_context->dscp = ipv4->dscp;
-	ip_context->ttl_hopl = ipv4->ttl;
-	ip_context->df = ipv4->df;
-	ip_context->last_ip_id = rohc_ntoh16(ipv4->id);
-
 	rohc_comp_dump_buf(context, "IPv4 dynamic part", rohc_data, ipv4_dynamic_len);
 
 	return ipv4_dynamic_len;
@@ -329,7 +274,7 @@ error:
  *                        -1 in case of error
  */
 static int tcp_code_dynamic_ipv6_part(const struct rohc_comp_ctxt *const context,
-                                      ip_context_t *const ip_context,
+                                      const ip_context_t *const ip_context,
                                       const struct ipv6_hdr *const ipv6,
                                       uint8_t *const rohc_data,
                                       const size_t rohc_max_len)
@@ -351,10 +296,6 @@ static int tcp_code_dynamic_ipv6_part(const struct rohc_comp_ctxt *const context
 	ipv6_dynamic->dscp = dscp;
 	ipv6_dynamic->ip_ecn_flags = ipv6->ecn;
 	ipv6_dynamic->ttl_hopl = ipv6->hl;
-
-	/* TODO: should not update context there */
-	ip_context->dscp = dscp;
-	ip_context->ttl_hopl = ipv6->hl;
 
 	rohc_comp_dump_buf(context, "IP dynamic part", rohc_data, ipv6_dynamic_len);
 

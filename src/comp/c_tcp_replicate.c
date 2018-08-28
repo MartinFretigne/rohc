@@ -32,15 +32,16 @@
 #include <assert.h>
 
 static int tcp_code_replicate_ipv4_part(const struct rohc_comp_ctxt *const context,
-                                        ip_context_t *const ip_context,
+                                        const ip_context_t *const ip_context,
                                         const struct ipv4_hdr *const ipv4,
-                                        const bool is_innermost,
+                                        const rohc_ip_id_behavior_t ip_id_behavior,
+                                        const bool ttl_changed,
                                         uint8_t *const rohc_data,
                                         const size_t rohc_max_len)
-	__attribute__((warn_unused_result, nonnull(1, 2, 3, 5)));
+	__attribute__((warn_unused_result, nonnull(1, 2, 3, 6)));
 
 static int tcp_code_replicate_ipv6_part(const struct rohc_comp_ctxt *const context,
-                                        ip_context_t *const ip_context,
+                                        const ip_context_t *const ip_context,
                                         const struct ipv6_hdr *const ipv6,
                                         uint8_t *const rohc_data,
                                         const size_t rohc_max_len)
@@ -78,7 +79,7 @@ int tcp_code_replicate_chain(const struct rohc_comp_ctxt *const context,
                              uint8_t *const rohc_pkt,
                              const size_t rohc_pkt_max_len)
 {
-	struct sc_tcp_context *const tcp_context = context->specific;
+	const struct sc_tcp_context *const tcp_context = context->specific;
 
 	uint8_t *rohc_remain_data = rohc_pkt;
 	size_t rohc_remain_len = rohc_pkt_max_len;
@@ -90,14 +91,17 @@ int tcp_code_replicate_chain(const struct rohc_comp_ctxt *const context,
 	for(ip_hdr_pos = 0; ip_hdr_pos < uncomp_pkt_hdrs->ip_hdrs_nr; ip_hdr_pos++)
 	{
 		const struct ip_hdr *const ip = uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].ip;
-		ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
-		const bool is_inner = !!(ip_hdr_pos + 1 == tcp_context->ip_contexts_nr);
+		const ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
+		const bool ttl_hopl_changed = tmp->ttl_hopl_changed[ip_hdr_pos];
 
 		if(ip->version == IPV4)
 		{
 			const struct ipv4_hdr *const ipv4 = (struct ipv4_hdr *) ip;
+			const rohc_ip_id_behavior_t ip_id_behavior =
+				tmp->ip_id_behaviors[ip_hdr_pos];
 
-			ret = tcp_code_replicate_ipv4_part(context, ip_context, ipv4, is_inner,
+			ret = tcp_code_replicate_ipv4_part(context, ip_context, ipv4,
+			                                   ip_id_behavior, ttl_hopl_changed,
 			                                   rohc_remain_data, rohc_remain_len);
 			if(ret < 0)
 			{
@@ -182,17 +186,18 @@ error:
  * @param context         The compression context
  * @param ip_context      The specific IP compression context
  * @param ipv4            The IPv4 header
- * @param is_innermost    true if the IP header is the innermost of the packet,
- *                        false otherwise
+ * @param ip_id_behavior  The IP-ID behavior of the IPv4 header
+ * @param ttl_changed     Whether the IP TTL changed
  * @param[out] rohc_data  The ROHC packet being built
  * @param rohc_max_len    The max remaining length in the ROHC buffer
  * @return                The length appended in the ROHC buffer if positive,
  *                        -1 in case of error
  */
 static int tcp_code_replicate_ipv4_part(const struct rohc_comp_ctxt *const context,
-                                        ip_context_t *const ip_context,
+                                        const ip_context_t *const ip_context,
                                         const struct ipv4_hdr *const ipv4,
-                                        const bool is_innermost,
+                                        const rohc_ip_id_behavior_t ip_id_behavior,
+                                        const bool ttl_changed,
                                         uint8_t *const rohc_data,
                                         const size_t rohc_max_len)
 {
@@ -214,28 +219,7 @@ static int tcp_code_replicate_ipv4_part(const struct rohc_comp_ctxt *const conte
 	ipv4_replicate->reserved = 0;
 
 	/* IP-ID behavior: cf. RFC6846 §6.1.2 and ip_id_enc_dyn() */
-	if(is_innermost)
-	{
-		/* all behavior values possible */
-		ipv4_replicate->ip_id_behavior = ip_context->ip_id_behavior;
-	}
-	else
-	{
-		/* only ROHC_IP_ID_BEHAVIOR_RAND or ROHC_IP_ID_BEHAVIOR_ZERO */
-		if(ipv4->id == 0)
-		{
-			ipv4_replicate->ip_id_behavior = ROHC_IP_ID_BEHAVIOR_ZERO;
-		}
-		else
-		{
-			ipv4_replicate->ip_id_behavior = ROHC_IP_ID_BEHAVIOR_RAND;
-		}
-		/* TODO: should not update context there */
-		ip_context->ip_id_behavior = ipv4_replicate->ip_id_behavior;
-	}
-	/* TODO: should not update context there */
-	ip_context->last_ip_id_behavior = ip_context->ip_id_behavior;
-
+	ipv4_replicate->ip_id_behavior = ip_id_behavior;
 	ipv4_replicate->df = ipv4->df;
 	ipv4_replicate->dscp = ipv4->dscp;
 	ipv4_replicate->ip_ecn_flags = ipv4->ecn;
@@ -264,30 +248,18 @@ static int tcp_code_replicate_ipv4_part(const struct rohc_comp_ctxt *const conte
 	}
 
 	/* ttl_hopl */
+	ret = c_static_or_irreg8(ipv4->ttl, !ttl_changed,
+	                         rohc_data + ipv4_replicate_len,
+	                         rohc_max_len - ipv4_replicate_len, &ttl_hopl_indicator);
+	if(ret < 0)
 	{
-		const bool is_ttl_hopl_static = (ip_context->ttl_hopl == ipv4->ttl);
-		const bool cr_ttl_hopl_needed =
-			(!is_ttl_hopl_static || ip_context->cr_ttl_hopl_present);
-		ret = c_static_or_irreg8(ipv4->ttl, !cr_ttl_hopl_needed,
-		                         rohc_data + ipv4_replicate_len,
-		                         rohc_max_len - ipv4_replicate_len, &ttl_hopl_indicator);
-		if(ret < 0)
-		{
-			rohc_comp_warn(context, "failed to encode static_or_irreg(ttl_hopl)");
-			goto error;
-		}
-		ipv4_replicate_len += ret;
-		rohc_comp_debug(context, "TTL = 0x%02x -> 0x%02x",
-		                ip_context->ttl_hopl, ipv4->ttl);
-		ipv4_replicate->ttl_flag = ttl_hopl_indicator;
-		ip_context->cr_ttl_hopl_present = !!ttl_hopl_indicator;
+		rohc_comp_warn(context, "failed to encode static_or_irreg(ttl_hopl)");
+		goto error;
 	}
-
-	/* TODO: should not update context there */
-	ip_context->dscp = ipv4->dscp;
-	ip_context->ttl_hopl = ipv4->ttl;
-	ip_context->df = ipv4->df;
-	ip_context->last_ip_id = rohc_ntoh16(ipv4->id);
+	ipv4_replicate_len += ret;
+	rohc_comp_debug(context, "TTL = 0x%02x -> 0x%02x",
+	                ip_context->ttl_hopl, ipv4->ttl);
+	ipv4_replicate->ttl_flag = ttl_hopl_indicator;
 
 	rohc_comp_dump_buf(context, "IPv4 replicate part", rohc_data, ipv4_replicate_len);
 
@@ -310,7 +282,7 @@ error:
  *                        -1 in case of error
  */
 static int tcp_code_replicate_ipv6_part(const struct rohc_comp_ctxt *const context,
-                                        ip_context_t *const ip_context,
+                                        const ip_context_t *const ip_context,
                                         const struct ipv6_hdr *const ipv6,
                                         uint8_t *const rohc_data,
                                         const size_t rohc_max_len)
@@ -359,10 +331,6 @@ static int tcp_code_replicate_ipv6_part(const struct rohc_comp_ctxt *const conte
 		ipv6_replicate2->flow_label1 = ipv6->flow1;
 		ipv6_replicate2->flow_label2 = ipv6->flow2;
 	}
-
-	/* TODO: should not update context there */
-	ip_context->dscp = dscp;
-	ip_context->ttl_hopl = ipv6->hl;
 
 	rohc_comp_dump_buf(context, "IPv6 replicate part", rohc_data, ipv6_replicate_len);
 
@@ -449,7 +417,7 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
                                        const size_t rohc_max_len)
 {
 	const uint8_t oa_repetitions_nr = context->compressor->oa_repetitions_nr;
-	struct sc_tcp_context *const tcp_context = context->specific;
+	const struct sc_tcp_context *const tcp_context = context->specific;
 	const struct tcphdr *const tcp = (struct tcphdr *) uncomp_pkt_hdrs->tcp;
 
 	uint8_t *rohc_remain_data = rohc_data;
@@ -525,8 +493,9 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
 
 	/* window */
 	{
-		const bool cr_tcp_window_needed = (tmp->tcp_window_changed ||
-		                                   tcp_context->cr_tcp_window_present);
+		const bool cr_tcp_window_needed =
+			(tmp->tcp_window_changed ||
+			 tcp_context->tcp_window_change_count < oa_repetitions_nr);
 		ret = c_static_or_irreg16(tcp->window, !cr_tcp_window_needed,
 		                          rohc_remain_data, rohc_remain_len, &indicator);
 		if(ret < 0)
@@ -535,7 +504,6 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
 			goto error;
 		}
 		tcp_replicate->window_presence = indicator;
-		tcp_context->cr_tcp_window_present = !!indicator;
 		rohc_remain_data += ret;
 		rohc_remain_len -= ret;
 		rohc_comp_debug(context, "window_indicator = %d, window = 0x%x on %d bytes",
@@ -549,7 +517,7 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
 	{
 		const bool cr_tcp_urg_ptr_needed =
 			(tmp->tcp_urg_ptr_changed ||
-			 tcp_context->cr_tcp_urg_ptr_present);
+			 tcp_context->tcp_urg_ptr_trans_nr < oa_repetitions_nr);
 		ret = c_static_or_irreg16(tcp->urg_ptr, !cr_tcp_urg_ptr_needed,
 		                          rohc_remain_data, rohc_remain_len, &indicator);
 		if(ret < 0)
@@ -558,7 +526,6 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
 			goto error;
 		}
 		tcp_replicate->urp_presence = indicator;
-		tcp_context->cr_tcp_urg_ptr_present = indicator;
 		rohc_remain_data += ret;
 		rohc_remain_len -= ret;
 		rohc_comp_debug(context, "urg_ptr_present = %d (URG pointer encoded on %d "
@@ -570,8 +537,9 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
 	 * important to transmit all packets without any change, even if those bits
 	 * will be ignored at reception */
 	{
-		const bool cr_tcp_ack_num_needed = (!tmp->tcp_ack_num_unchanged ||
-		                                    tcp_context->cr_tcp_ack_num_present);
+		const bool cr_tcp_ack_num_needed =
+			(!tmp->tcp_ack_num_unchanged ||
+			 tcp_context->tcp_ack_num_trans_nr < oa_repetitions_nr);
 		ret = c_static_or_irreg32(tcp->ack_num, !cr_tcp_ack_num_needed,
 		                          rohc_remain_data, rohc_remain_len, &indicator);
 		if(ret < 0)
@@ -580,7 +548,6 @@ static int tcp_code_replicate_tcp_part(const struct rohc_comp_ctxt *const contex
 			goto error;
 		}
 		tcp_replicate->ack_presence = indicator;
-		tcp_context->cr_tcp_ack_num_present = !!indicator;
 		rohc_remain_data += ret;
 		rohc_remain_len -= ret;
 		rohc_comp_debug(context, "TCP ack_number %spresent",
