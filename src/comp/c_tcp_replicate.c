@@ -92,12 +92,12 @@ int tcp_code_replicate_chain(const struct rohc_comp_ctxt *const context,
 		const struct rohc_pkt_ip_hdr *const ip_hdr =
 			&(uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos]);
 		const ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
-		const bool ttl_hopl_changed = tmp->ttl_hopl_changed[ip_hdr_pos];
+		const bool ttl_hopl_changed = tmp->changes[ip_hdr_pos].ttl_hopl_changed;
 
 		if(ip_hdr->version == IPV4)
 		{
 			const rohc_ip_id_behavior_t ip_id_behavior =
-				tmp->ip_id_behaviors[ip_hdr_pos];
+				tmp->changes[ip_hdr_pos].ip_id_behavior;
 
 			ret = tcp_code_replicate_ipv4_part(context, ip_context, ip_hdr->ipv4,
 			                                   ip_id_behavior, ttl_hopl_changed,
