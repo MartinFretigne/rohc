@@ -95,13 +95,13 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 static uint16_t c_tcp_get_next_msn(const struct rohc_comp_ctxt *const context)
 	__attribute__((warn_unused_result, nonnull(1)));
 
-static void tcp_detect_changes(struct rohc_comp_ctxt *const context,
-                               ip_context_t *const inner_ip_ctxt, /* TODO: const */
+static void tcp_detect_changes(const struct rohc_comp_ctxt *const context,
+                               const ip_context_t *const inner_ip_ctxt,
                                const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                                struct tcp_tmp_variables *const tmp)
 	__attribute__((nonnull(1, 2, 3, 4)));
-static void tcp_detect_changes_ipv6_exts(struct rohc_comp_ctxt *const context,
-                                         ip_context_t *const ip_context, /* TODO: const */
+static void tcp_detect_changes_ipv6_exts(const struct rohc_comp_ctxt *const context,
+                                         const ip_context_t *const ip_context,
                                          const struct rohc_pkt_ip_hdr *const ip_hdr,
                                          struct tcp_tmp_variables *const tmp)
 	__attribute__((nonnull(1, 2, 3, 4)));
@@ -980,17 +980,16 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 	/* update the context for all IP headers */
 	for(ip_hdr_pos = 0; ip_hdr_pos < tcp_context->ip_contexts_nr; ip_hdr_pos++)
 	{
-		const struct ip_hdr *const ip_hdr = uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].ip;
+		const struct rohc_pkt_ip_hdr *const ip_hdr =
+			&(uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos]);
 		ip_context_t *const ip_ctxt = &(tcp_context->ip_contexts[ip_hdr_pos]);
 
-		tcp_context->ip_contexts[ip_hdr_pos].opts_nr =
-			uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos].exts_nr;
-
+		ip_ctxt->opts_nr = ip_hdr->exts_nr;
 		ip_ctxt->ip_id_behavior = tmp.ip_id_behaviors[ip_hdr_pos];
 
 		if(ip_hdr->version == IPV4)
 		{
-			const struct ipv4_hdr *const ipv4 = (struct ipv4_hdr *) ip_hdr;
+			const struct ipv4_hdr *const ipv4 = ip_hdr->ipv4;
 			ip_ctxt->dscp = ipv4->dscp;
 			ip_ctxt->ttl_hopl = ipv4->ttl;
 			ip_ctxt->df = ipv4->df;
@@ -1003,9 +1002,27 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 		}
 		else
 		{
-			const struct ipv6_hdr *const ipv6 = (struct ipv6_hdr *) ip_hdr;
+			const struct ipv6_hdr *const ipv6 = ip_hdr->ipv6;
+			uint8_t ext_pos;
+
 			ip_ctxt->dscp = ipv6_get_dscp(ipv6);
 			ip_ctxt->ttl_hopl = ipv6->hl;
+
+			/* record IPv6 extension headers in context if at least one of them
+			 * has just changed */
+			if(tmp.is_ipv6_exts_list_static_just_changed ||
+			   tmp.is_ipv6_exts_list_dyn_just_changed)
+			{
+				for(ext_pos = 0; ext_pos < ip_hdr->exts_nr; ext_pos++)
+				{
+					const struct rohc_pkt_ip_ext_hdr *const ext = &(ip_hdr->exts[ext_pos]);
+					ip_option_context_t *const opt_ctxt = &(ip_ctxt->opts[ext_pos]);
+
+					opt_ctxt->generic.option_length = ext->len;
+					assert((ext->len - 2U) <= IPV6_OPT_CTXT_LEN_MAX);
+					memcpy(opt_ctxt->generic.data, ext->data + 2, ext->len - 2);
+				}
+			}
 		}
 		/* add the new innermost TTL/Hop Limit to the W-LSB encoding object */
 		if((ip_hdr_pos + 1) == tcp_context->ip_contexts_nr)
@@ -1115,9 +1132,17 @@ static int c_tcp_encode(struct rohc_comp_ctxt *const context,
 	{
 		tcp_context->innermost_dscp_trans_nr++;
 	}
+	if(tmp.is_ipv6_exts_list_static_just_changed)
+	{
+		tcp_context->ipv6_exts_list_static_trans_nr = 0;
+	}
 	if(tcp_context->ipv6_exts_list_static_trans_nr < oa_repetitions_nr)
 	{
 		tcp_context->ipv6_exts_list_static_trans_nr++;
+	}
+	if(tmp.is_ipv6_exts_list_dyn_just_changed)
+	{
+		tcp_context->ipv6_exts_list_dyn_trans_nr = 0;
 	}
 	if(tcp_context->ipv6_exts_list_dyn_trans_nr < oa_repetitions_nr)
 	{
@@ -3097,8 +3122,8 @@ error:
  * @param uncomp_pkt_hdrs  The uncompressed headers to encode
  * @param tmp              The temporary state for the compressed packet
  */
-static void tcp_detect_changes(struct rohc_comp_ctxt *const context,
-                               ip_context_t *const inner_ip_ctxt, /* TODO: const */
+static void tcp_detect_changes(const struct rohc_comp_ctxt *const context,
+                               const ip_context_t *const inner_ip_ctxt,
                                const struct rohc_pkt_hdrs *const uncomp_pkt_hdrs,
                                struct tcp_tmp_variables *const tmp)
 {
@@ -3110,7 +3135,9 @@ static void tcp_detect_changes(struct rohc_comp_ctxt *const context,
 	uint8_t pkt_ecn_vals;
 
 	/* no IPv6 extension got its static or dynamic parts changed at the beginning */
+	tmp->is_ipv6_exts_list_static_just_changed = false;
 	tmp->is_ipv6_exts_list_static_changed = false;
+	tmp->is_ipv6_exts_list_dyn_just_changed = false;
 	tmp->is_ipv6_exts_list_dyn_changed = false;
 
 	/* by default, no outer IP-ID changed its behavior */
@@ -3126,7 +3153,7 @@ static void tcp_detect_changes(struct rohc_comp_ctxt *const context,
 	tmp->ttl_irreg_chain_flag = 0;
 	for(ip_hdr_pos = 0; ip_hdr_pos < uncomp_pkt_hdrs->ip_hdrs_nr; ip_hdr_pos++)
 	{
-		ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
+		const ip_context_t *const ip_context = &(tcp_context->ip_contexts[ip_hdr_pos]);
 		const bool is_innermost = !!((ip_hdr_pos + 1) == uncomp_pkt_hdrs->ip_hdrs_nr);
 		const struct rohc_pkt_ip_hdr *const ip_hdr = &(uncomp_pkt_hdrs->ip_hdrs[ip_hdr_pos]);
 		const uint8_t dscp = ip_hdr->dscp;
@@ -3362,19 +3389,21 @@ static void tcp_detect_changes(struct rohc_comp_ctxt *const context,
  * @param ip_hdr      The information collected about the packet IP header
  * @param tmp         The temporary state for the compressed packet
  */
-static void tcp_detect_changes_ipv6_exts(struct rohc_comp_ctxt *const context,
-                                         ip_context_t *const ip_context, /* TODO: const */
+static void tcp_detect_changes_ipv6_exts(const struct rohc_comp_ctxt *const context,
+                                         const ip_context_t *const ip_context,
                                          const struct rohc_pkt_ip_hdr *const ip_hdr,
                                          struct tcp_tmp_variables *const tmp)
 {
 	const uint8_t oa_repetitions_nr = context->compressor->oa_repetitions_nr;
-	struct sc_tcp_context *const tcp_context = context->specific;
+	const struct sc_tcp_context *const tcp_context = context->specific;
 	uint8_t ext_pos;
 
 	rohc_comp_debug(context, "detect changes of %u IP extension headers",
 	                ip_hdr->exts_nr);
 
+	tmp->is_ipv6_exts_list_static_just_changed = false;
 	tmp->is_ipv6_exts_list_static_changed = false;
+	tmp->is_ipv6_exts_list_dyn_just_changed = false;
 	tmp->is_ipv6_exts_list_dyn_changed = false;
 
 	/* more or less IP extension headers than context? */
@@ -3383,19 +3412,19 @@ static void tcp_detect_changes_ipv6_exts(struct rohc_comp_ctxt *const context,
 	{
 		rohc_comp_debug(context, "  less IP extension headers (%u) than "
 		                "context (%u)", ip_hdr->exts_nr, ip_context->opts_nr);
-		tmp->is_ipv6_exts_list_static_changed = true;
+		tmp->is_ipv6_exts_list_static_just_changed = true;
 	}
 	else if(ip_hdr->exts_nr > ip_context->opts_nr)
 	{
 		rohc_comp_debug(context, "  more IP extension headers (%u) than "
 		                "context (%u)", ip_hdr->exts_nr, ip_context->opts_nr);
-		tmp->is_ipv6_exts_list_static_changed = true;
+		tmp->is_ipv6_exts_list_static_just_changed = true;
 	}
 
 	/* detect the changes for each header */
 	for(ext_pos = 0; ext_pos < ip_hdr->exts_nr; ext_pos++)
 	{
-		ip_option_context_t *const opt_ctxt = &(ip_context->opts[ext_pos]);
+		const ip_option_context_t *const opt_ctxt = &(ip_context->opts[ext_pos]);
 		const struct rohc_pkt_ip_ext_hdr *const ext = &(ip_hdr->exts[ext_pos]);
 
 		rohc_comp_debug(context, "  found IP extension header %u", ext->type);
@@ -3415,59 +3444,50 @@ static void tcp_detect_changes_ipv6_exts(struct rohc_comp_ctxt *const context,
 		if(ext_pos >= ip_context->opts_nr)
 		{
 			rohc_comp_debug(context, "  IPv6 option %u is new", ext->type);
-			tmp->is_ipv6_exts_list_static_changed = true;
+			tmp->is_ipv6_exts_list_static_just_changed = true;
 		}
 		else if(ext->len != opt_ctxt->generic.option_length)
 		{
 			rohc_comp_debug(context, "  IPv6 option %u changed length (%u -> %u bytes)",
 			                ext->type, opt_ctxt->generic.option_length, ext->len);
-			tmp->is_ipv6_exts_list_static_changed = true;
+			tmp->is_ipv6_exts_list_static_just_changed = true;
 		}
 		else if(memcmp(ext->data + 2, opt_ctxt->generic.data, ext->len - 2) != 0)
 		{
 			rohc_comp_debug(context, "  IPv6 option %u changed of content", ext->type);
 			if(ext->type == ROHC_IPPROTO_ROUTING)
 			{
-				tmp->is_ipv6_exts_list_static_changed = true;
+				tmp->is_ipv6_exts_list_static_just_changed = true;
 			}
 			else
 			{
-				tmp->is_ipv6_exts_list_dyn_changed = true;
+				tmp->is_ipv6_exts_list_dyn_just_changed = true;
 			}
 		}
 		else
 		{
 			rohc_comp_debug(context, "  IPv6 option %u did not change", ext->type);
 		}
-
-		/* record option in context if required */
-		if(tmp->is_ipv6_exts_list_static_changed ||
-		   tmp->is_ipv6_exts_list_dyn_changed)
-		{
-			/* TODO: should not update context there */
-			opt_ctxt->generic.option_length = ext->len;
-			assert((ext->len - 2U) <= IPV6_OPT_CTXT_LEN_MAX);
-			memcpy(opt_ctxt->generic.data, ext->data + 2, ext->len - 2);
-		}
 	}
 
-	if(tmp->is_ipv6_exts_list_static_changed)
+	if(tmp->is_ipv6_exts_list_static_just_changed)
 	{
-		rohc_comp_debug(context, "  IPv6 extension headers changed too much, static "
-		                "chain is required");
-		tcp_context->ipv6_exts_list_static_trans_nr = 0;
+		rohc_comp_debug(context, "  IPv6 extension headers changed too much in "
+		                "current packet, static chain is required");
+		tmp->is_ipv6_exts_list_static_changed = true;
 	}
 	else if(tcp_context->ipv6_exts_list_static_trans_nr < oa_repetitions_nr)
 	{
-		rohc_comp_debug(context, "  IPv6 extension headers changed too much "
-		                "in last packets, static chain is required");
+		rohc_comp_debug(context, "  IPv6 extension headers changed too much in "
+		                "last packets, static chain is required at least %u times",
+		                oa_repetitions_nr - tcp_context->ipv6_exts_list_static_trans_nr);
 		tmp->is_ipv6_exts_list_static_changed = true;
 	}
-	else if(tmp->is_ipv6_exts_list_dyn_changed)
+	else if(tmp->is_ipv6_exts_list_dyn_just_changed)
 	{
 		rohc_comp_debug(context, "  IPv6 extension headers changed too much, dynamic "
 		                "chain is required");
-		tcp_context->ipv6_exts_list_dyn_trans_nr = 0;
+		tmp->is_ipv6_exts_list_dyn_changed = true;
 	}
 	else if(tcp_context->ipv6_exts_list_dyn_trans_nr < oa_repetitions_nr)
 	{
